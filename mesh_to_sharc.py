@@ -100,7 +100,8 @@ def run_pipeline(args):
             uniformity_weight=args.uniformity_weight,
             centrality_weight=args.centrality_weight,
             min_distance_from_surface=args.min_distance_from_surface,
-            max_points=args.max_reference_points
+            max_points=args.max_reference_points,
+            exact_points=args.exact_reference_points
         )
     print(f"  Selected {len(ref_points)} reference points.")
 
@@ -166,7 +167,11 @@ if __name__ == "__main__":
     parser.add_argument('--centrality_weight', type=float, default=1.0)
     parser.add_argument('--min_distance_from_surface', type=float, default=1e-4)
     parser.add_argument('--max_reference_points', type=int, default=1000)
-    
+    parser.add_argument('--exact_reference_points', action='store_true',
+                        help='Return exactly --max_reference_points points. '
+                             'After surface coverage saturates, keep selecting '
+                             'by centrality/uniformity until the count is hit.')
+
     # SHARC Model Params
     parser.add_argument('--lfit', type=int, default=64, help='SH degree for fitting')
     parser.add_argument('--lrecon', type=int, default=64, help='SH degree for reconstruction')

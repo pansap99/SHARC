@@ -16,7 +16,8 @@ def compute_skeleton_points_visibility(
     random_sample_number: int = 100000,
     min_distance_from_surface: float = 1e-5,
     generate_candidates: bool = False,
-    save_candidates_path: str = None
+    save_candidates_path: str = None,
+    exact_points: bool = False
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute skeleton points using visibility-based selection method.
@@ -42,8 +43,14 @@ def compute_skeleton_points_visibility(
         centrality_weight: Weight for centrality/interiority (0-1+). Higher values
                           favor points that are farther from the surface (more interior).
                           Recommended range: 0.3-1.0
-        max_points: Maximum number of skeleton points to select. If None, 
+        max_points: Maximum number of skeleton points to select. If None,
                    continues until all coverable points are covered
+        exact_points: If True, always return exactly max_points points. Once
+                     surface coverage is saturated, selection continues using
+                     only the centrality/uniformity scores until max_points is
+                     reached (bounded by the number of candidates). Requires
+                     max_points to be set. Default False keeps the original
+                     behaviour of stopping early once coverage is complete.
         random_sample_number: Number of random points to sample inside mesh 
                              if generate_candidates=True
         generate_candidates: If True and init_skeleton_points is None, will
@@ -106,9 +113,9 @@ def compute_skeleton_points_visibility(
         o3d.io.write_point_cloud(save_candidates_path, candidate_pcd)
         print(f"Candidate points saved successfully.")
     
-    # Sample points on mesh surface uniformly
-    print(f"Sampling {surface_samples} points on mesh surface...")
-    pcd = o3d_mesh.sample_points_uniformly(number_of_points=surface_samples)
+    # Sample points on mesh surface using Poisson disk sampling
+    print(f"Sampling {surface_samples} points on mesh surface with Poisson disk sampling...")
+    pcd = o3d_mesh.sample_points_poisson_disk(number_of_points=surface_samples)
     sampled_points = np.array(pcd.points)
     print(f"Surface sampling complete.")
     
@@ -128,7 +135,8 @@ def compute_skeleton_points_visibility(
         proximity_threshold=proximity_threshold,
         uniformity_weight=uniformity_weight,
         centrality_weight=centrality_weight,
-        max_points=max_points
+        max_points=max_points,
+        exact_points=exact_points
     )
     
     # Get the final selected points
@@ -147,7 +155,8 @@ def _select_visibility_points(
     proximity_threshold: float,
     uniformity_weight: float = 1.0,
     centrality_weight: float = 0.5,
-    max_points: int = None
+    max_points: int = None,
+    exact_points: bool = False
 ) -> np.ndarray:
     """
     Modified version of select_visibility_points2.
@@ -221,8 +230,10 @@ def _select_visibility_points(
 
     for iteration in range(max_iter):
 
-        # Stop if all surface points are covered
-        if len(S_uncovered) == 0:
+        # Stop if all surface points are covered.
+        # When exact_points is set we keep going (ranking purely by the
+        # centrality + uniformity terms below) until max_points is reached.
+        if len(S_uncovered) == 0 and not exact_points:
             print("All coverable points are covered.")
             break
 
@@ -232,9 +243,12 @@ def _select_visibility_points(
 
         # Penalize already-selected or unavailable points immediately
         score[~P_available] = -np.inf
-        
-        # Stop if no available candidates can cover any new points
-        if np.max(score) == 0:
+
+        # Stop if no available candidates can cover any new points.
+        # In exact_points mode this is not a stop condition: coverage may be
+        # saturated but we still need more points, so we fall through and let
+        # centrality/uniformity drive the selection.
+        if np.max(score) == 0 and not exact_points:
             print("Stopping: No remaining candidates can cover new points.")
             break
 
