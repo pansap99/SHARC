@@ -21,44 +21,89 @@ from sharc.utils.io import create_output_structure
 # Import SHARC Core
 from sharc.core.model import SharcModel, SharcConfig
 
+
+class _StageTimer:
+    """Times a `with` block and stores the elapsed seconds in `store[name]`."""
+    def __init__(self, name, store):
+        self.name = name
+        self.store = store
+
+    def __enter__(self):
+        self._t0 = time.time()
+        return self
+
+    def __exit__(self, *exc):
+        self.store[self.name] = time.time() - self._t0
+        return False
+
+
+def _print_timings(timings, total_time, num_ref_points):
+    """Print a per-stage timing breakdown table to the terminal."""
+    labels = {
+        'preprocess': 'Preprocess (load/normalize)',
+        'random_interior_points': 'Random interior sampling',
+        'reference_selection': 'Reference point selection',
+        'sh_fit': 'SH fitting (raycast + transform)',
+        'save': 'Save model',
+    }
+    print("\n" + "=" * 56)
+    print(f"  TIMING BREAKDOWN  ({num_ref_points} reference points)")
+    print("=" * 56)
+    for key, label in labels.items():
+        if key in timings:
+            t = timings[key]
+            pct = (t / total_time * 100) if total_time > 0 else 0.0
+            print(f"  {label:<36s} {t:7.2f}s ({pct:4.1f}%)")
+    print("-" * 56)
+    print(f"  {'TOTAL':<36s} {total_time:7.2f}s")
+    print("=" * 56 + "\n")
+
+
 def run_pipeline(args):
     start_time = time.time()
-    
+    timings = {}
+
+    def _stage(name):
+        """Context manager that records wall-clock time for a pipeline stage."""
+        return _StageTimer(name, timings)
+
     # Setup Output Structure
     paths = create_output_structure(args.input_mesh, args.output_dir)
     print(f"Output directory: {paths['root']}")
 
     # Preprocessing (Normalization)
     print("[1/5] Preprocessing Mesh...")
-    preprocessor = MeshPreprocessor(args.input_mesh)
-    preprocessor.normalize(buffer=1.0, scale=1.0, move_to_origin=True, use_simplified=False)
-    preprocessor.save_meshes(paths['input'])
-    mesh_detailed = preprocessor.normalized_mesh_detailed
-    
+    with _stage('preprocess'):
+        preprocessor = MeshPreprocessor(args.input_mesh)
+        preprocessor.normalize(buffer=1.0, scale=1.0, move_to_origin=True, use_simplified=False)
+        preprocessor.save_meshes(paths['input'])
+        mesh_detailed = preprocessor.normalized_mesh_detailed
+        mesh_o3d = trimesh_to_open3d(mesh_detailed)
+
     # Reference Points Selection
     print("[2/5] Generating Reference Points...")
-    mesh_o3d = trimesh_to_open3d(mesh_detailed)
-    
-    # Initial random sampling
-    random_points = generate_random_interior_points_raycasting(
-        mesh_o3d,
-        num_samples=args.random_samples,
-        min_distance_to_surface=args.min_distance_random
-    )
-    
-    # Optimal reference point selection
-    ref_points, _ = compute_skeleton_points_visibility(
-        mesh_detailed,
-        surface_samples=args.num_surface_samples,
-        init_skeleton_points=random_points,
-        proximity_threshold=args.proximity_threshold,
-        uniformity_weight=args.uniformity_weight,
-        centrality_weight=args.centrality_weight,
-        min_distance_from_surface=args.min_distance_from_surface,
-        max_points=args.max_reference_points
-    )
+    with _stage('random_interior_points'):
+        # Initial random sampling
+        random_points = generate_random_interior_points_raycasting(
+            mesh_o3d,
+            num_samples=args.random_samples,
+            min_distance_to_surface=args.min_distance_random
+        )
+
+    with _stage('reference_selection'):
+        # Optimal reference point selection
+        ref_points, _ = compute_skeleton_points_visibility(
+            mesh_detailed,
+            surface_samples=args.num_surface_samples,
+            init_skeleton_points=random_points,
+            proximity_threshold=args.proximity_threshold,
+            uniformity_weight=args.uniformity_weight,
+            centrality_weight=args.centrality_weight,
+            min_distance_from_surface=args.min_distance_from_surface,
+            max_points=args.max_reference_points
+        )
     print(f"  Selected {len(ref_points)} reference points.")
-    
+
     # Save skeleton
     skeleton_pcd = o3d.geometry.PointCloud()
     skeleton_pcd.points = o3d.utility.Vector3dVector(ref_points)
@@ -66,7 +111,7 @@ def run_pipeline(args):
 
     # 4. Initialize and Fit SHARC Model
     print("[3/5] Fitting SHARC Model...")
-    
+
     # Create Config from Args
     config = SharcConfig(
         L_fit=args.lfit,
@@ -76,14 +121,17 @@ def run_pipeline(args):
         lanczos_smoothing=args.lanczos_smoothing,
         k=args.k_nn
     )
-    
+
     model = SharcModel(config, ref_points=ref_points, coeffs=None)
-    repr_time = time.time()
-    model.fit(mesh_o3d, device=args.device)
-    repr_time = time.time() - repr_time
-    
+    with _stage('sh_fit'):
+        model.fit(mesh_o3d, device=args.device)
+    repr_time = timings['sh_fit']
+
     # Save Model
-    model.save(paths['coeffs'])
+    with _stage('save'):
+        model.save(paths['coeffs'])
+
+    total_time = time.time() - start_time
 
     # Metadata
     metadata = {
@@ -91,13 +139,15 @@ def run_pipeline(args):
         'config': asdict(config),
         'metrics': {
             'num_ref_points': len(ref_points),
-            'total_time': time.time() - start_time,
-            'repr_time': repr_time
+            'total_time': total_time,
+            'repr_time': repr_time,
+            'stage_timings': timings
         }
     }
     with open(os.path.join(paths['root'], 'metadata.json'), 'w') as f:
         json.dump(metadata, f, indent=2)
 
+    _print_timings(timings, total_time, len(ref_points))
     print("Pipeline Finished Successfully.")
 
 if __name__ == "__main__":

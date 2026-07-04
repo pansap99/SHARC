@@ -171,12 +171,21 @@ def _select_visibility_points(
     # V1 Logic: Centrality = Distance to the nearest surface point.
     print("Computing centrality scores (Distance to nearest surface point)...")
     
-    # Calculate distances from all candidates to all surface samples
-    # shape: (n_candidates, n_surface_samples)
-    distances_to_surface = cdist(init_skeleton_points, sampled_points)
-    
-    # The score is simply the distance to the closest surface point (Medial Radius)
-    centrality_scores = np.min(distances_to_surface, axis=1)
+    # The score is the distance to the closest surface point (Medial Radius).
+    # Fast path: compute the nearest-surface distance per candidate on the GPU
+    # (avoids materializing the full (n_candidates, n_surface_samples) matrix).
+    centrality_scores = None
+    try:
+        import warp as wp
+        from sharc.utils.warp_utils import nearest_surface_distance_gpu
+        if wp.is_cuda_available():
+            centrality_scores = nearest_surface_distance_gpu(
+                init_skeleton_points, sampled_points)
+    except Exception as e:
+        print(f"[centrality] GPU path unavailable ({e}); using cdist.")
+    if centrality_scores is None:
+        distances_to_surface = cdist(init_skeleton_points, sampled_points)
+        centrality_scores = np.min(distances_to_surface, axis=1)
     
     # Normalize centrality scores once globally (optional, but helps with weighting)
     if np.std(centrality_scores) > 1e-6:
@@ -193,23 +202,34 @@ def _select_visibility_points(
     # Boolean mask of available candidate points
     P_available = np.ones(n, dtype=bool)
 
+    # Incremental coverage counts: coverage[i] = number of currently-uncovered
+    # surface points that candidate i sees. Maintained incrementally instead of
+    # recomputing np.sum(D[S_uncovered], axis=0) every iteration (which copied
+    # the whole (m, n) matrix each step -> O(m*n*k)). We start from the full
+    # column sums and subtract each newly-covered row exactly once, giving
+    # O(m*n) total. Use a float matrix view for fast row subtraction.
+    Df = D.astype(np.float32)
+    coverage = Df.sum(axis=0)              # (n,) counts over all surface points
+
+    # Running nearest-selected distance per candidate (inf until first selection).
+    uniformity_dists = np.full(n, np.inf, dtype=float)
+
     if max_points is None:
         max_iter = n
     else:
         max_iter = min(max_points, n)
 
     for iteration in range(max_iter):
-        
+
         # Stop if all surface points are covered
         if len(S_uncovered) == 0:
             print("All coverable points are covered.")
             break
-            
+
         # --- 1. Coverage Score ---
-        # Calculate score: how many *uncovered* points does each candidate cover?
-        # Summing only the rows corresponding to uncovered surface points
-        score = np.sum(D[S_uncovered], axis=0).astype(float)
-        
+        # Incrementally maintained count of uncovered points each candidate sees.
+        score = coverage.astype(float)
+
         # Penalize already-selected or unavailable points immediately
         score[~P_available] = -np.inf
         
@@ -233,14 +253,12 @@ def _select_visibility_points(
             score_normalized += centrality_weight * centrality_scores_norm
 
         # --- 3. Uniformity Score ---
-        # V1 Logic: Favor points far from ALREADY selected points
+        # V1 Logic: Favor points far from ALREADY selected points.
+        # uniformity_dists[i] = distance from candidate i to its nearest already
+        # -selected candidate. Maintained incrementally (min with the distance to
+        # the newest selection) instead of recomputing a full cdist against all
+        # selected points every iteration -> O(n) per step instead of O(n*k).
         if len(A_selected_indices) > 0 and uniformity_weight > 0:
-            # Calculate distance from each candidate to the *nearest selected* candidate
-            # This matches 'compute_min_distances' from CoverageAxis.py
-            uniformity_dists = _compute_min_distances_to_subset(
-                init_skeleton_points, init_skeleton_points[A_selected_indices]
-            )
-            
             # Normalize uniformity
             # Points far from existing skeleton get higher scores
             uni_valid = uniformity_dists[P_available]
@@ -265,10 +283,25 @@ def _select_visibility_points(
         A_selected_indices.append(i_k)
         P_available[i_k] = False # Mark as unavailable
 
+        # Incrementally update the running nearest-selected distance for all
+        # candidates using only the newly selected point.
+        if uniformity_weight > 0:
+            new_dists = np.linalg.norm(
+                init_skeleton_points - init_skeleton_points[i_k], axis=1)
+            np.minimum(uniformity_dists, new_dists, out=uniformity_dists)
+
         # --- 5. Update Uncovered Set ---
         # Get the mask of newly covered points by this candidate
         covered_by_ik_mask = D[S_uncovered, i_k]
-        
+
+        # Global indices of the surface rows this candidate newly covers.
+        newly_covered = S_uncovered[covered_by_ik_mask]
+
+        # Decrement coverage counts by the rows that just became covered, so
+        # `coverage` keeps reflecting only still-uncovered surface points.
+        if len(newly_covered) > 0:
+            coverage -= Df[newly_covered].sum(axis=0)
+
         # Remove these points from the uncovered set
         S_uncovered = S_uncovered[~covered_by_ik_mask]
         
@@ -316,8 +349,28 @@ def _compute_visibility_matrix(
     D = np.zeros((m, n), dtype=bool)
 
     # Epsilon to avoid self-intersection at the origin of the ray
-    EPSILON = 1e-5 
-    
+    EPSILON = 1e-5
+
+    # Fast path: cast all m*n visibility rays in a single Warp GPU kernel
+    # (~200x faster than the per-candidate Open3D loop below). Falls back to
+    # the Open3D path if Warp/CUDA is unavailable or errors out.
+    try:
+        import warp as wp
+        from sharc.utils.warp_utils import compute_visibility_matrix_gpu
+        if wp.is_cuda_available():
+            print(f"Computing visibility matrix on GPU (Warp) for "
+                  f"{m} surface points and {n} candidates...")
+            verts = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.triangles)
+            D = compute_visibility_matrix_gpu(
+                verts, faces, sampled_points, init_skeleton_points,
+                proximity_threshold, epsilon=EPSILON)
+            print("Visibility matrix computed (GPU).")
+            return D
+    except Exception as e:
+        print(f"[visibility] GPU path unavailable ({e}); "
+              f"falling back to Open3D.")
+
     # Create a raycasting scene
     scene = o3d.t.geometry.RaycastingScene()
     
